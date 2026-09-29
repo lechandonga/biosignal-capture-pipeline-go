@@ -8,6 +8,37 @@ import (
 	"io"
 )
 
+// FooterMagic marks a sealed segment carrying a trailing key index.
+var FooterMagic = [4]byte{'B', 'S', 'P', 'F'}
+
+const footerSize = 4 + 8 // magic + uint64 indexOffset
+
+// WriteFooter appends the fixed-size footer that locates the index frame.
+func WriteFooter(w io.Writer, indexOffset int64) error {
+	var buf [footerSize]byte
+	copy(buf[:4], FooterMagic[:])
+	binary.LittleEndian.PutUint64(buf[4:], uint64(indexOffset))
+	_, err := w.Write(buf[:])
+	return err
+}
+
+// ReadFooter validates the trailing footer of a file of the given size.
+func ReadFooter(r io.ReaderAt, size int64) (indexOffset int64, ok bool) {
+	if size < footerSize {
+		return 0, false
+	}
+	var buf [footerSize]byte
+	if _, err := r.ReadAt(buf[:], size-footerSize); err != nil {
+		return 0, false
+	}
+	var magic [4]byte
+	copy(magic[:], buf[:4])
+	if magic != FooterMagic {
+		return 0, false
+	}
+	return int64(binary.LittleEndian.Uint64(buf[4:])), true
+}
+
 // Record framing: each record is
 //
 //	uint32 LE payload length
@@ -79,4 +110,55 @@ func readFrames(r io.Reader) ([][]byte, error) {
 		}
 		out = append(out, payload)
 	}
+}
+
+// FrameReader streams CRC-framed payloads without buffering the whole file,
+// so range exports can process multi-hour segments with constant memory.
+type FrameReader struct {
+	br  *bufio.Reader
+	hdr [lenSize]byte
+	ftr [crcSize]byte
+}
+
+// NewFrameReader wraps r with a streaming frame reader.
+func NewFrameReader(r io.Reader) *FrameReader {
+	return &FrameReader{br: bufio.NewReader(r)}
+}
+
+// Next returns the next intact payload. io.EOF marks a clean end;
+// io.ErrUnexpectedEOF marks a torn trailing frame.
+func (f *FrameReader) Next() ([]byte, error) {
+	if _, err := io.ReadFull(f.br, f.hdr[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, io.EOF
+		}
+		return nil, err
+	}
+	{
+		var magic [4]byte
+		copy(magic[:], f.hdr[:4])
+		if magic == FooterMagic {
+			// Trailing footer at a frame boundary: skip offset bytes, clean EOF.
+			var off [8]byte
+			if _, err := io.ReadFull(f.br, off[:]); err != nil {
+				return nil, io.ErrUnexpectedEOF
+			}
+			return nil, io.EOF
+		}
+	}
+	n := binary.LittleEndian.Uint32(f.hdr[:])
+	if n == 0 || n > maxRecord {
+		return nil, errors.New("storage: implausible record length")
+	}
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(f.br, payload); err != nil {
+		return nil, io.ErrUnexpectedEOF
+	}
+	if _, err := io.ReadFull(f.br, f.ftr[:]); err != nil {
+		return nil, io.ErrUnexpectedEOF
+	}
+	if crc32.ChecksumIEEE(payload) != binary.LittleEndian.Uint32(f.ftr[:]) {
+		return nil, errCRC
+	}
+	return payload, nil
 }

@@ -57,6 +57,8 @@ func main() {
 	p := pipeline.New(pipeline.Config{
 		SessionID: "demo", QueueDepth: 4096, BatchSize: 128,
 		FlushInterval: time.Second, Policy: pipeline.PolicyDelay, EnqueueWait: 20 * time.Millisecond,
+		SegmentSpan: time.Second, ArchiveAfter: 30 * time.Second,
+		QuotaBytes: 64 << 20, MaintInterval: 100 * time.Millisecond,
 	}, cals, rules, st)
 
 	must(p.RegisterDevice("wrist-1"))
@@ -148,6 +150,32 @@ func main() {
 		}
 	}
 	fmt.Println("\nstorage root:", *dir)
+
+	// Demonstrate a time-range export across segments (incl. any archived
+	// ones) with the completeness summary.
+	fmt.Println("\n=== time-range export ===")
+	sum, err := st.ExportRange(storage.RangeFilter{
+		From:    t0,
+		To:      t0.Add(*duration + time.Second),
+		Devices: []model.DeviceID{"wrist-1"},
+	}, func(r storage.RangeRecord) error {
+		return nil
+	})
+	must(err)
+	fmt.Printf("scannedSegments=%v samples=%d events=%d rejected=%d\n",
+		sum.ScannedSegments, sum.Samples, sum.Events, sum.Rejected)
+	for _, iv := range sum.CompleteIntervals {
+		fmt.Printf("COMPLETE  %s .. %s\n", iv.From.Format("15:04:05.000"), iv.To.Format("15:04:05.000"))
+	}
+	for _, inc := range sum.Incomplete {
+		fmt.Printf("INCOMPLETE %s reason=%s %s\n", inc.From.Format("15:04:05.000"), inc.Reason, inc.Detail)
+	}
+	for _, iv := range sum.NoData {
+		fmt.Printf("NODATA    %s .. %s\n", iv.From.Format("15:04:05.000"), iv.To.Format("15:04:05.000"))
+	}
+	audit, err := st.ReclaimAudit()
+	must(err)
+	fmt.Printf("reclaim audit entries=%d\n", len(audit))
 }
 
 func stats(p *pipeline.Pipeline) pipeline.Stats { return p.Stats() }

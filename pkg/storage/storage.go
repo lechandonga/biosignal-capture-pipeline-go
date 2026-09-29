@@ -41,6 +41,7 @@ const (
 	recSample byte = 2
 	recEvent  byte = 3
 	recReject byte = 4
+	recIndex  byte = 5
 )
 
 var (
@@ -52,6 +53,8 @@ var (
 	ErrBatchNotComplete = errors.New("storage: batch not complete")
 	// ErrCorrupt marks an unreadable frame inside a batch.
 	ErrCorrupt = errors.New("storage: corrupt batch frame")
+	// ErrBatchBusy is returned when an operation targets a pinned segment.
+	ErrBatchBusy = errors.New("storage: segment busy (read/export in progress)")
 )
 
 type jsonHeader struct {
@@ -109,10 +112,13 @@ type envelope struct {
 
 // handle is an open batch writer.
 type handle struct {
-	mu sync.Mutex
-	f  *os.File
-	w  *os.File // same file; buffered framing written directly
-	id string
+	mu        sync.Mutex
+	f         *os.File
+	w         *os.File // same file; buffered framing written directly
+	id        string
+	sessionID string
+	startedAt time.Time
+	bytes     int64
 }
 
 // Store is the file-backed batch store.
@@ -120,6 +126,17 @@ type Store struct {
 	root string
 	mu   sync.Mutex
 	open map[string]*handle
+
+	metaMu    sync.Mutex
+	metaCache map[string]*model.SegmentMeta
+
+	pinMu  sync.Mutex
+	pins   map[string]int
+	pinGen uint64
+
+	// lifeMu serializes file-lifecycle transitions (archive/reclaim rename
+	// and remove) against readers resolving+opening a data file.
+	lifeMu sync.RWMutex
 }
 
 // Open opens (or recovers) a store rooted at dir.
@@ -130,7 +147,19 @@ func Open(dir string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(dir, dirArchive), 0o755); err != nil {
 		return nil, err
 	}
-	return &Store{root: dir, open: map[string]*handle{}}, nil
+	if err := os.MkdirAll(filepath.Join(dir, dirMeta), 0o755); err != nil {
+		return nil, err
+	}
+	s := &Store{
+		root:      dir,
+		open:      map[string]*handle{},
+		metaCache: map[string]*model.SegmentMeta{},
+		pins:      map[string]int{},
+	}
+	if err := s.recoverReclaim(); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 func (s *Store) partialPath(id string) string {
@@ -162,7 +191,7 @@ func (s *Store) CreateBatch(id, sessionID string, startedAt time.Time) error {
 		s.mu.Unlock()
 		return err
 	}
-	h := &handle{f: f, id: id}
+	h := &handle{f: f, id: id, sessionID: sessionID, startedAt: startedAt}
 	s.open[id] = h
 	s.mu.Unlock()
 
@@ -185,6 +214,19 @@ func (s *Store) getOpen(batchID string) (*handle, error) {
 		return nil, fmt.Errorf("%w: %s", ErrBatchOpen, batchID)
 	}
 	return h, nil
+}
+
+// OpenBatchBytes reports the current byte size of an open batch file.
+func (s *Store) OpenBatchBytes(batchID string) int64 {
+	s.mu.Lock()
+	h := s.open[batchID]
+	s.mu.Unlock()
+	if h == nil {
+		return 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.bytes
 }
 
 // AppendBatchSample appends one calibrated sample atomically (frame + fsync).
@@ -243,7 +285,13 @@ func (h *handle) append(typ byte, v any) error {
 	if err := writeFrame(h.f, append([]byte{typ}, raw...)); err != nil {
 		return err
 	}
-	return h.f.Sync()
+	if err := h.f.Sync(); err != nil {
+		return err
+	}
+	if fi, err := h.f.Stat(); err == nil {
+		h.bytes = fi.Size()
+	}
+	return nil
 }
 
 // CompleteBatch seals a batch: fsync and atomic rename to .batch.
@@ -259,22 +307,11 @@ func (s *Store) CompleteBatch(batchID string, closedAt time.Time) error {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if err := h.f.Sync(); err != nil {
+	if err := s.sortAndSeal(h, batchID, h.sessionID, h.startedAt, closedAt); err != nil {
+		// Rewrite failed before the rename: re-register the handle is not
+		// possible; leave the .partial on disk for INCOMPLETE recovery.
 		return err
 	}
-	if err := h.f.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(s.partialPath(batchID), s.batchPath(batchID)); err != nil {
-		return err
-	}
-	// closedAt is recorded implicitly by file mtime + reader state; we also
-	// ensure the directory entry is durable.
-	if dir, err := os.Open(filepath.Join(s.root, dirBatches)); err == nil {
-		_ = dir.Sync()
-		_ = dir.Close()
-	}
-	_ = closedAt
 	return nil
 }
 
@@ -282,6 +319,14 @@ func (s *Store) CompleteBatch(batchID string, closedAt time.Time) error {
 // the uncompressed original. The rename-in-place guarantees readers either
 // observe the complete batch or the complete archive, never a half file.
 func (s *Store) ArchiveBatch(batchID string) error {
+	if s.IsPinned(batchID) {
+		return fmt.Errorf("%w: %s is being read/exported", ErrBatchBusy, batchID)
+	}
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	if s.IsPinned(batchID) {
+		return fmt.Errorf("%w: %s is being read/exported", ErrBatchBusy, batchID)
+	}
 	b, err := s.LoadBatch(batchID)
 	if err != nil {
 		return err
@@ -289,26 +334,28 @@ func (s *Store) ArchiveBatch(batchID string) error {
 	if b.State != model.BatchComplete {
 		return fmt.Errorf("%w: %s state=%s", ErrBatchNotComplete, batchID, b.State)
 	}
-	raw, err := os.ReadFile(s.batchPath(batchID))
+	in, err := os.Open(s.batchPath(batchID))
 	if err != nil {
 		return err
 	}
-	tmp := s.archivePath(batchID) + ".tmp"
+	defer in.Close()
+	final := s.archivePath(batchID)
+	tmp := final + ".arch.tmp"
 	gf, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	gz := gzip.NewWriter(gf)
+	gzw := gzip.NewWriter(gf)
 	cleanup := func() {
-		_ = gz.Close()
+		_ = gzw.Close()
 		_ = gf.Close()
 		_ = os.Remove(tmp)
 	}
-	if _, err := gz.Write(raw); err != nil {
+	if _, err := io.Copy(gzw, in); err != nil {
 		cleanup()
 		return err
 	}
-	if err := gz.Close(); err != nil {
+	if err := gzw.Close(); err != nil {
 		_ = gf.Close()
 		_ = os.Remove(tmp)
 		return err
@@ -322,11 +369,24 @@ func (s *Store) ArchiveBatch(batchID string) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := os.Rename(tmp, s.archivePath(batchID)); err != nil {
+	if err := os.Rename(tmp, final); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Remove(s.batchPath(batchID))
+	fsyncDir(filepath.Join(s.root, dirArchive))
+	if err := os.Remove(s.batchPath(batchID)); err != nil {
+		return err
+	}
+	fsyncDir(filepath.Join(s.root, dirBatches))
+	if m, err := s.SegmentMeta(batchID); err == nil {
+		m.State = model.BatchArchived
+		if fi, err := os.Stat(final); err == nil {
+			m.Bytes = fi.Size()
+		}
+		s.setMeta(batchID, m)
+		_ = s.writeSidecar(m)
+	}
+	return nil
 }
 
 // LoadBatch reads a batch back in any state. A .partial batch is reported
@@ -363,25 +423,37 @@ func (s *Store) LoadBatch(batchID string) (*model.Batch, error) {
 		defer zr.Close()
 		rdr = zr
 	}
-	frames, err := readFrames(bufioNewReader(rdr))
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
-		return nil, err
-	}
-	if errors.Is(err, io.ErrUnexpectedEOF) {
-		// A torn frame can only happen on an open/partial batch; downgrade
-		// state so callers can refuse to treat it as finished.
-		state = model.BatchIncomplete
-	}
-
 	b := &model.Batch{ID: batchID, State: state}
-	for _, fr := range frames {
-		if len(fr) == 0 {
+	fr := NewFrameReader(rdr)
+	var torn bool
+	for {
+		payload, err := fr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			torn = true
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(payload) == 0 {
 			continue
 		}
-		env := envelope{Type: fr[0], Raw: fr[1:]}
+		if payload[0] == recIndex {
+			continue // trailing key index, not domain data
+		}
+		env := envelope{Type: payload[0], Raw: payload[1:]}
 		if perr := decodeInto(&env, b); perr != nil {
 			return nil, fmt.Errorf("%w: %v", ErrCorrupt, perr)
 		}
+	}
+	if torn {
+		// A torn frame can only happen on an open/partial batch; downgrade
+		// state so callers can refuse to treat it as finished.
+		state = model.BatchIncomplete
+		b.State = state
 	}
 	return b, nil
 }
@@ -416,6 +488,11 @@ func (s *Store) ListBatches() ([]string, error) {
 	if err := add(filepath.Join(s.root, dirArchive), extGz); err != nil {
 		return nil, err
 	}
+	if err := add(filepath.Join(s.root, dirMeta), extMeta); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
 	out := make([]string, 0, len(seen))
 	for id := range seen {
 		out = append(out, id)
@@ -440,6 +517,21 @@ func (s *Store) Close() error {
 	return firstErr
 }
 
+// Abandon drops the in-memory open handle for a batch without sealing it,
+// simulating a process crash. The .partial file remains on disk.
+func (s *Store) Abandon(batchID string) error {
+	s.mu.Lock()
+	h := s.open[batchID]
+	delete(s.open, batchID)
+	s.mu.Unlock()
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.f.Close()
+}
+
 // bufioNewReader wraps an io.Reader with buffering.
 func bufioNewReader(r io.Reader) *bufio.Reader { return bufio.NewReader(r) }
 
@@ -454,53 +546,113 @@ func decodeInto(env *envelope, b *model.Batch) error {
 		b.SessionID = h.SessionID
 		b.StartedAt = h.StartedAt
 	case recSample:
-		var js jsonSample
-		if err := json.Unmarshal(env.Raw, &js); err != nil {
+		smp, err := decodeSample(env)
+		if err != nil {
 			return err
 		}
-		b.Samples = append(b.Samples, model.CalibratedSample{
-			Aligned: model.AlignedSample{
-				Device:   model.DeviceID(js.Device),
-				Sensor:   model.SensorID(js.Sensor),
-				Kind:     model.SignalKind(js.Kind),
-				Seq:      js.Seq,
-				UniTime:  js.UniTime,
-				RecvTime: js.RecvTime,
-				Values:   js.Values,
-				Quality:  js.Quality,
-				Gap:      js.Gap,
-			},
-			CalVersion:  js.CalVersion,
-			Values:      js.CalValues,
-			Baseline:    js.Baseline,
-			Uncertain:   js.Uncertain,
-			Uncertainty: js.Uncertainty,
-		})
+		b.Samples = append(b.Samples, *smp)
 	case recEvent:
-		var je jsonEvent
-		if err := json.Unmarshal(env.Raw, &je); err != nil {
+		ev, err := decodeEvent(env)
+		if err != nil {
 			return err
 		}
-		b.Events = append(b.Events, model.Event{
-			Device: model.DeviceID(je.Device), Sensor: model.SensorID(je.Sensor),
-			Kind: model.SignalKind(je.Kind), Level: model.EventLevel(je.Level),
-			Start: je.Start, End: je.End, Value: je.Value, Threshold: je.Threshold,
-			RuleID: je.RuleID, CalVersion: je.CalVersion, Evidence: je.Evidence, At: je.At,
-		})
+		b.Events = append(b.Events, *ev)
 	case recReject:
-		var jr jsonReject
-		if err := json.Unmarshal(env.Raw, &jr); err != nil {
+		rj, err := decodeReject(env)
+		if err != nil {
 			return err
 		}
-		b.Rejected = append(b.Rejected, model.RejectedRecord{
-			Action: model.Action(jr.Action),
-			Sample: model.RawSample{
-				Device: model.DeviceID(jr.Device), Sensor: model.SensorID(jr.Sensor), Seq: jr.Seq,
-			},
-			Reason: model.RejectReason(jr.Reason), Detail: jr.Detail, At: jr.At,
-		})
+		b.Rejected = append(b.Rejected, *rj)
 	default:
 		return fmt.Errorf("unknown record type %d", env.Type)
 	}
 	return nil
+}
+
+func sampleToJSON(smp *model.CalibratedSample) jsonSample {
+	return jsonSample{
+		Device: string(smp.Aligned.Device), Sensor: string(smp.Aligned.Sensor),
+		Kind: string(smp.Aligned.Kind), Seq: smp.Aligned.Seq,
+		UniTime: smp.Aligned.UniTime, RecvTime: smp.Aligned.RecvTime,
+		Values: smp.Aligned.Values, Quality: smp.Aligned.Quality, Gap: smp.Aligned.Gap,
+		CalVersion: smp.CalVersion, CalValues: smp.Values, Baseline: smp.Baseline,
+		Uncertain: smp.Uncertain, Uncertainty: smp.Uncertainty,
+	}
+}
+
+func eventToJSON(ev *model.Event) jsonEvent {
+	return jsonEvent{
+		Device: string(ev.Device), Sensor: string(ev.Sensor), Kind: string(ev.Kind),
+		Level: string(ev.Level), Start: ev.Start, End: ev.End, Value: ev.Value,
+		Threshold: ev.Threshold, RuleID: ev.RuleID, CalVersion: ev.CalVersion,
+		Evidence: ev.Evidence, At: ev.At,
+	}
+}
+
+func rejectToJSON(r *model.RejectedRecord) jsonReject {
+	return jsonReject{
+		Action: string(r.Action), Device: string(r.Sample.Device),
+		Sensor: string(r.Sample.Sensor), Seq: r.Sample.Seq,
+		Reason: string(r.Reason), Detail: r.Detail, At: r.At,
+	}
+}
+
+func marshalFrame(typ byte, v any) ([]byte, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return append([]byte{typ}, raw...), nil
+}
+
+func decodeSample(env *envelope) (*model.CalibratedSample, error) {
+	var js jsonSample
+	if err := json.Unmarshal(env.Raw, &js); err != nil {
+		return nil, err
+	}
+	return &model.CalibratedSample{
+		Aligned: model.AlignedSample{
+			Device:   model.DeviceID(js.Device),
+			Sensor:   model.SensorID(js.Sensor),
+			Kind:     model.SignalKind(js.Kind),
+			Seq:      js.Seq,
+			UniTime:  js.UniTime,
+			RecvTime: js.RecvTime,
+			Values:   js.Values,
+			Quality:  js.Quality,
+			Gap:      js.Gap,
+		},
+		CalVersion:  js.CalVersion,
+		Values:      js.CalValues,
+		Baseline:    js.Baseline,
+		Uncertain:   js.Uncertain,
+		Uncertainty: js.Uncertainty,
+	}, nil
+}
+
+func decodeEvent(env *envelope) (*model.Event, error) {
+	var je jsonEvent
+	if err := json.Unmarshal(env.Raw, &je); err != nil {
+		return nil, err
+	}
+	return &model.Event{
+		Device: model.DeviceID(je.Device), Sensor: model.SensorID(je.Sensor),
+		Kind: model.SignalKind(je.Kind), Level: model.EventLevel(je.Level),
+		Start: je.Start, End: je.End, Value: je.Value, Threshold: je.Threshold,
+		RuleID: je.RuleID, CalVersion: je.CalVersion, Evidence: je.Evidence, At: je.At,
+	}, nil
+}
+
+func decodeReject(env *envelope) (*model.RejectedRecord, error) {
+	var jr jsonReject
+	if err := json.Unmarshal(env.Raw, &jr); err != nil {
+		return nil, err
+	}
+	return &model.RejectedRecord{
+		Action: model.Action(jr.Action),
+		Sample: model.RawSample{
+			Device: model.DeviceID(jr.Device), Sensor: model.SensorID(jr.Sensor), Seq: jr.Seq,
+		},
+		Reason: model.RejectReason(jr.Reason), Detail: jr.Detail, At: jr.At,
+	}, nil
 }

@@ -20,6 +20,7 @@ package pipeline
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,6 +66,11 @@ type Config struct {
 	FlushInterval time.Duration // max age of an open batch before sealing
 	Policy        Policy        // backpressure policy
 	EnqueueWait   time.Duration // max block under PolicyDelay
+	SegmentSpan   time.Duration // max unified-time span of one segment (0 disables)
+	SegmentBytes  int64         // max accumulated bytes of one segment (0 disables)
+	ArchiveAfter  time.Duration // auto-gzip sealed segments older than this (0 disables)
+	QuotaBytes    int64         // store-wide live data cap (0 disables reclaim)
+	MaintInterval time.Duration // housekeeping tick (archive + quota)
 }
 
 // Stats summarizes a session for verification.
@@ -98,6 +104,7 @@ type Pipeline struct {
 
 	logMu    sync.Mutex
 	rejected []model.RejectedRecord
+	aborted  bool // test crash simulation: drain but leave the segment open
 
 	statsMu sync.Mutex
 	stats   Stats
@@ -106,6 +113,8 @@ type Pipeline struct {
 	openBatch   string
 	batchCount  int
 	batchSince  time.Time
+	batchFirst  time.Time
+	batchBytes  int64
 	rejectedDur int // rejection-log entries already persisted to storage
 }
 
@@ -122,6 +131,9 @@ func New(cfg Config, cals *calibration.Store, rules []detect.Rule, st *storage.S
 	}
 	if cfg.EnqueueWait <= 0 {
 		cfg.EnqueueWait = 50 * time.Millisecond
+	}
+	if cfg.MaintInterval <= 0 {
+		cfg.MaintInterval = time.Second
 	}
 	return &Pipeline{
 		cfg:      cfg,
@@ -248,6 +260,8 @@ func (p *Pipeline) Run() {
 		ticker = time.NewTicker(p.cfg.FlushInterval)
 		defer ticker.Stop()
 	}
+	maint := time.NewTicker(p.cfg.MaintInterval)
+	defer maint.Stop()
 	// With ticker == nil the flush arm reads from a nil channel and never
 	// fires, disabling periodic sealing safely.
 
@@ -259,12 +273,16 @@ func (p *Pipeline) Run() {
 		select {
 		case s, ok := <-p.queue:
 			if !ok {
-				p.sealBatch()
+				if !p.aborted {
+					p.sealBatch()
+				}
 				return
 			}
 			p.process(s)
 		case <-flushC:
 			p.flushIfOld()
+		case <-maint.C:
+			p.maintain()
 		}
 	}
 }
@@ -398,7 +416,16 @@ func (p *Pipeline) persist(cal model.CalibratedSample, events []model.Event) {
 	}
 	p.flushRejectedIntoBatch()
 	p.batchCount++
-	if p.batchCount >= p.cfg.BatchSize {
+	p.batchBytes = p.st.OpenBatchBytes(p.openBatch)
+	roll := p.batchCount >= p.cfg.BatchSize
+	if !roll && p.cfg.SegmentSpan > 0 && !p.batchFirst.IsZero() &&
+		cal.Aligned.UniTime.Sub(p.batchFirst) >= p.cfg.SegmentSpan {
+		roll = true
+	}
+	if !roll && p.cfg.SegmentBytes > 0 && p.batchBytes >= p.cfg.SegmentBytes {
+		roll = true
+	}
+	if roll {
 		p.sealBatch()
 	}
 }
@@ -407,14 +434,21 @@ func (p *Pipeline) ensureBatch(now time.Time) error {
 	if p.openBatch != "" {
 		return nil
 	}
+	if p.batchID == 0 {
+		if err := p.resumeState(); err != nil {
+			return err
+		}
+	}
 	p.batchID++
 	id := fmt.Sprintf("%s-batch-%06d", p.cfg.SessionID, p.batchID)
 	if err := p.st.CreateBatch(id, p.cfg.SessionID, now); err != nil {
 		return err
 	}
 	p.openBatch = id
-	p.batchSince = now
+	p.batchSince = time.Now()
+	p.batchFirst = now
 	p.batchCount = 0
+	p.batchBytes = 0
 	p.flushRejectedIntoBatch()
 	return nil
 }
@@ -425,6 +459,12 @@ func (p *Pipeline) sealBatch() {
 	}
 	id := p.openBatch
 	if err := p.st.CompleteBatch(id, time.Now()); err != nil {
+		// The .partial stays on disk and is recovered as INCOMPLETE; never
+		// keep appending into it. Continue with a fresh segment.
+		p.openBatch = ""
+		p.batchCount = 0
+		p.batchBytes = 0
+		p.batchFirst = time.Time{}
 		return
 	}
 	p.statsMu.Lock()
@@ -432,6 +472,8 @@ func (p *Pipeline) sealBatch() {
 	p.statsMu.Unlock()
 	p.openBatch = ""
 	p.batchCount = 0
+	p.batchBytes = 0
+	p.batchFirst = time.Time{}
 }
 
 func (p *Pipeline) flushIfOld() {
@@ -440,6 +482,65 @@ func (p *Pipeline) flushIfOld() {
 	}
 	if time.Since(p.batchSince) >= p.cfg.FlushInterval {
 		p.sealBatch()
+	}
+}
+
+// resumeState scans existing segments of this session after a restart:
+// sealed segments are preserved as-is and the sequence counter continues
+// after them; an INCOMPLETE segment from the crash is left untouched and
+// never appended to.
+func (p *Pipeline) resumeState() error {
+	metas, err := p.st.Segments()
+	if err != nil {
+		return err
+	}
+	maxIdx := 0
+	prefix := p.cfg.SessionID + "-batch-"
+	for _, m := range metas {
+		if m.SessionID != p.cfg.SessionID && !strings.HasPrefix(m.ID, prefix) {
+			continue
+		}
+		if m.Index > maxIdx {
+			maxIdx = m.Index
+		}
+		if m.State != model.BatchReclaimed {
+			p.statsMu.Lock()
+			p.stats.Batches = append(p.stats.Batches, m.ID)
+			p.statsMu.Unlock()
+		}
+	}
+	p.batchID = maxIdx
+	return nil
+}
+
+// maintain auto-archives aged sealed segments and enforces the quota.
+// Called only from the single worker, so it never races appends.
+func (p *Pipeline) maintain() {
+	p.mu.Lock()
+	archiveAfter := p.cfg.ArchiveAfter
+	quota := p.cfg.QuotaBytes
+	p.mu.Unlock()
+	if archiveAfter <= 0 && quota <= 0 {
+		return
+	}
+	metas, err := p.st.Segments()
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-archiveAfter)
+	for _, m := range metas {
+		if m.State != model.BatchComplete || archiveAfter <= 0 {
+			continue
+		}
+		if !m.ClosedAt.IsZero() && m.ClosedAt.After(cutoff) {
+			continue
+		}
+		_ = p.st.ArchiveBatch(m.ID)
+	}
+	if quota > 0 {
+		if _, err := p.st.EnforceQuota(quota); err != nil {
+			return
+		}
 	}
 }
 
@@ -522,6 +623,37 @@ func (p *Pipeline) Stop() {
 	p.mu.Unlock()
 	close(p.queue)
 	p.wg.Wait()
+}
+
+// Abort simulates a process crash for tests: ingestion stops and the queue
+// drains, but the open segment is intentionally left unsealed on disk.
+func (p *Pipeline) Abort() {
+	<-p.started
+	p.ingestGate.Lock()
+	defer p.ingestGate.Unlock()
+	p.mu.Lock()
+	p.aborted = true
+	p.closed = true
+	p.mu.Unlock()
+	close(p.queue)
+	p.wg.Wait()
+	// Drop the open file handle like a crashed process would.
+	if p.openBatch != "" {
+		p.st.Abandon(p.openBatch)
+	}
+	p.openBatch = ""
+}
+
+// flushOpenForTest forces the current segment to seal synchronously.
+func (p *Pipeline) flushOpenForTest() {
+	p.sealBatch()
+}
+
+// SetQuotaBytes updates the storage cap safely while the worker is running.
+func (p *Pipeline) SetQuotaBytes(n int64) {
+	p.mu.Lock()
+	p.cfg.QuotaBytes = n
+	p.mu.Unlock()
 }
 
 func recvOrNow(s model.RawSample) time.Time {

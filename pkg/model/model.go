@@ -37,6 +37,8 @@ const (
 	ReasonUnifiedRollback    RejectReason = "unified_time_rollback"
 	ReasonSessionClosed      RejectReason = "session_closed"
 	ReasonNoCalibration      RejectReason = "no_valid_calibration"
+	ReasonSegmentIncomplete  RejectReason = "segment_incomplete"
+	ReasonSegmentReclaimed   RejectReason = "segment_reclaimed"
 )
 
 // Action distinguishes a rejected record from one that was accepted but
@@ -135,6 +137,7 @@ const (
 	BatchIncomplete BatchState = "INCOMPLETE"
 	BatchComplete   BatchState = "COMPLETE"
 	BatchArchived   BatchState = "ARCHIVED"
+	BatchReclaimed  BatchState = "RECLAIMED"
 )
 
 // Batch is the unit of durable storage and recovery.
@@ -148,4 +151,36 @@ type Batch struct {
 	Events    []Event
 	Rejected  []RejectedRecord
 	CRC       uint32
+}
+
+// GapMarker is a compact time-ordered marker explaining why a segment's
+// timeline is incomplete at a particular point: packet loss, a rejected
+// sample, or a torn/incomplete segment suffix.
+type GapMarker struct {
+	At     time.Time
+	Device DeviceID
+	Sensor SensorID
+	Reason RejectReason // packet_loss / duplicate_sample / ... / segment_incomplete
+	Detail string
+}
+
+// SegmentMeta is the per-segment sidecar metadata used for segment pruning
+// and completeness analysis without opening (or decompressing) the segment.
+type SegmentMeta struct {
+	ID            string
+	SessionID     string
+	Index         int // sequence index within the session (from the id suffix)
+	State         BatchState
+	StartedAt     time.Time
+	ClosedAt      time.Time
+	FirstTime     time.Time
+	LastTime      time.Time
+	SampleCount   int
+	EventCount    int
+	RejectedCount int
+	Bytes         int64
+	Sorted        bool // frames are in canonical time order (sealed segments)
+	Devices       []string
+	Sensors       []string
+	Markers       []GapMarker
 }
