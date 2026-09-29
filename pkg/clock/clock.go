@@ -11,6 +11,7 @@ package clock
 
 import (
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/lechandonga/biosignal-capture-pipeline-go/pkg/model"
@@ -61,6 +62,7 @@ type sensorState struct {
 
 // Discipline tracks clock offset and drift for the sensors of one device.
 type Discipline struct {
+	mu      sync.Mutex
 	device  model.DeviceID
 	sensors map[model.SensorID]*sensorState
 }
@@ -86,6 +88,8 @@ func (d *Discipline) Device() model.DeviceID { return d.device }
 // sensor. Duplicate sequences and clock rollbacks are rejected with distinct
 // errors; the caller is expected to log them, never to silently drop them.
 func (d *Discipline) Correct(sensor model.SensorID, seq int64, devTime, recvTime time.Time) (time.Time, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	st := d.state(sensor)
 
 	// 1) Sequence is the monotonic ground truth.
@@ -173,6 +177,8 @@ func offsetFor(st *sensorState, devTime time.Time) time.Duration {
 // advances the last-seen sequence. Gaps therefore reserve their positions on
 // the stream without polluting drift estimation.
 func (d *Discipline) CheckSequence(sensor model.SensorID, seq int64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	st := d.state(sensor)
 	if st.haveSeq && seq <= st.lastSeq {
 		if seq == st.lastSeq {
@@ -189,6 +195,8 @@ func (d *Discipline) CheckSequence(sensor model.SensorID, seq int64) error {
 // traceability but stop influencing the fit; sequence continuity is still
 // enforced so data across the gap is neither repeated nor lost.
 func (d *Discipline) Reconnect(sensor model.SensorID, recvTime time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	st := d.state(sensor)
 	st.epoch++
 	// First post-reconnect sample re-anchors against recvTime; until then we
@@ -198,16 +206,24 @@ func (d *Discipline) Reconnect(sensor model.SensorID, recvTime time.Time) error 
 }
 
 // Epoch returns the current epoch for a sensor (0 before any reconnect).
-func (d *Discipline) Epoch(sensor model.SensorID) int { return d.state(sensor).epoch }
+func (d *Discipline) Epoch(sensor model.SensorID) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.state(sensor).epoch
+}
 
 // LastSeq returns the last accepted sequence for a sensor.
 func (d *Discipline) LastSeq(sensor model.SensorID) (int64, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	st := d.state(sensor)
 	return st.lastSeq, st.haveSeq
 }
 
 // Offset returns the most recent instantaneous host-device offset for a sensor.
 func (d *Discipline) Offset(sensor model.SensorID) time.Duration {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	st := d.state(sensor)
 	if len(st.anchors) == 0 {
 		return 0

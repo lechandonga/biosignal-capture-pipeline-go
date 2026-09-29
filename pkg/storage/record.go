@@ -44,39 +44,61 @@ func writeFrame(w io.Writer, payload []byte) error {
 	return nil
 }
 
-// readFrames returns all intact payloads in order. A torn final frame (crash
-// mid-write) causes io.ErrUnexpectedEOF to be returned together with the
-// intact prefix; callers treat such a batch as INCOMPLETE rather than
-// silently joining the partial suffix.
-func readFrames(r io.Reader) ([][]byte, error) {
-	br, ok := r.(*bufio.Reader)
-	if !ok {
-		br = bufio.NewReader(r)
-	}
-	var out [][]byte
-	var hdr [lenSize]byte
-	var ftr [crcSize]byte
-	for {
-		if _, err := io.ReadFull(br, hdr[:]); err != nil {
-			if errors.Is(err, io.EOF) {
-				return out, nil
-			}
-			return out, err
-		}
-		n := binary.LittleEndian.Uint32(hdr[:])
-		if n == 0 || n > maxRecord {
-			return out, errors.New("storage: implausible record length")
-		}
-		payload := make([]byte, n)
-		if _, err := io.ReadFull(br, payload); err != nil {
-			return out, io.ErrUnexpectedEOF // torn payload
-		}
-		if _, err := io.ReadFull(br, ftr[:]); err != nil {
-			return out, io.ErrUnexpectedEOF // torn CRC
-		}
-		if got := crc32.ChecksumIEEE(payload); got != binary.LittleEndian.Uint32(ftr[:]) {
-			return out, errCRC
-		}
-		out = append(out, payload)
-	}
+// frameScanner streams length-prefixed CRC frames from an underlying reader
+// one frame at a time, so exports never have to hold a whole segment in
+// memory. A torn final frame (crash mid-write) is reported as
+// io.ErrUnexpectedEOF after every intact frame has been yielded.
+type frameScanner struct {
+	br      *bufio.Reader
+	payload []byte
+	scanErr error
 }
+
+func newFrameScanner(r io.Reader) *frameScanner {
+	if br, ok := r.(*bufio.Reader); ok {
+		return &frameScanner{br: br}
+	}
+	return &frameScanner{br: bufio.NewReader(r)}
+}
+
+// next advances to the next intact frame. It returns false when the stream is
+// exhausted; err() distinguishes a clean EOF (nil) from a torn/corrupt tail.
+func (fs *frameScanner) next() bool {
+	if fs.scanErr != nil {
+		return false
+	}
+	var hdr [lenSize]byte
+	if _, err := io.ReadFull(fs.br, hdr[:]); err != nil {
+		if errors.Is(err, io.EOF) {
+			fs.scanErr = nil
+		} else {
+			fs.scanErr = err
+		}
+		return false
+	}
+	n := binary.LittleEndian.Uint32(hdr[:])
+	if n == 0 || n > maxRecord {
+		fs.scanErr = errors.New("storage: implausible record length")
+		return false
+	}
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(fs.br, payload); err != nil {
+		fs.scanErr = io.ErrUnexpectedEOF // torn payload
+		return false
+	}
+	var ftr [crcSize]byte
+	if _, err := io.ReadFull(fs.br, ftr[:]); err != nil {
+		fs.scanErr = io.ErrUnexpectedEOF // torn CRC
+		return false
+	}
+	if got := crc32.ChecksumIEEE(payload); got != binary.LittleEndian.Uint32(ftr[:]) {
+		fs.scanErr = errCRC
+		return false
+	}
+	fs.payload = payload
+	return true
+}
+
+func (fs *frameScanner) bytes() []byte { return fs.payload }
+
+func (fs *frameScanner) err() error { return fs.scanErr }

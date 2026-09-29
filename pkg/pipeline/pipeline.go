@@ -59,12 +59,17 @@ type SensorBinding struct {
 
 // Config configures the pipeline bounds and batching.
 type Config struct {
-	SessionID     string
-	QueueDepth    int           // max queued raw samples (backpressure bound)
-	BatchSize     int           // calibrated samples per durable batch
-	FlushInterval time.Duration // max age of an open batch before sealing
-	Policy        Policy        // backpressure policy
-	EnqueueWait   time.Duration // max block under PolicyDelay
+	SessionID       string
+	QueueDepth      int           // max queued raw samples (backpressure bound)
+	BatchSize       int           // max calibrated samples per segment
+	SegmentMaxAge   time.Duration // max wall-clock span of one open segment
+	SegmentMaxBytes int64         // max on-disk bytes of one open segment
+	FlushInterval   time.Duration // deprecated: alias for SegmentMaxAge
+	ArchiveAfter    time.Duration // auto-archive sealed segments older than this
+	StorageLimit    int64         // max total bytes on disk (oldest sealed reclaimed)
+	Maintenance     time.Duration // archive/quota maintenance interval
+	Policy          Policy        // backpressure policy
+	EnqueueWait     time.Duration // max block under PolicyDelay
 }
 
 // Stats summarizes a session for verification.
@@ -107,6 +112,7 @@ type Pipeline struct {
 	batchCount  int
 	batchSince  time.Time
 	rejectedDur int // rejection-log entries already persisted to storage
+	maintTimer  *time.Ticker
 }
 
 // New constructs a pipeline.
@@ -116,6 +122,12 @@ func New(cfg Config, cals *calibration.Store, rules []detect.Rule, st *storage.S
 	}
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = 256
+	}
+	if cfg.SegmentMaxAge <= 0 {
+		cfg.SegmentMaxAge = cfg.FlushInterval
+	}
+	if cfg.Maintenance <= 0 {
+		cfg.Maintenance = time.Second
 	}
 	if cfg.Policy == "" {
 		cfg.Policy = PolicyReject
@@ -235,21 +247,44 @@ func (p *Pipeline) isClosed() bool {
 	return p.closed
 }
 
+// Resume prepares the pipeline to continue an existing session after a
+// process restart: it advances the segment counter past every segment id
+// already present on disk. Incomplete segments from the previous run are
+// never reopened or appended to — new samples always land in a fresh segment.
+func (p *Pipeline) Resume() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n := p.st.NextSessionSeq(p.cfg.SessionID); n > p.batchID {
+		p.batchID = n - 1
+	}
+}
+
+// applyStoragePolicy pushes the configured quota onto the store. It is safe
+// to call before Run and again after a restart.
+func (p *Pipeline) applyStoragePolicy() {
+	if p.cfg.StorageLimit > 0 {
+		p.st.SetQuota(p.cfg.StorageLimit)
+	}
+}
+
 // Run is the single processing worker. Stop closes the queue once all in-flight
 // Ingest calls have finished; ranging over it drains every accepted sample
-// (none is silently dropped) before sealing the final batch.
+// (none is silently dropped) before sealing the final segment.
 func (p *Pipeline) Run() {
 	p.wg.Add(1)
 	defer p.wg.Done()
 	close(p.started)
+	p.applyStoragePolicy()
 
 	var ticker *time.Ticker
-	if p.cfg.FlushInterval > 0 {
-		ticker = time.NewTicker(p.cfg.FlushInterval)
+	if p.cfg.SegmentMaxAge > 0 {
+		ticker = time.NewTicker(p.cfg.SegmentMaxAge)
 		defer ticker.Stop()
 	}
 	// With ticker == nil the flush arm reads from a nil channel and never
 	// fires, disabling periodic sealing safely.
+	p.maintTimer = time.NewTicker(p.cfg.Maintenance)
+	defer p.maintTimer.Stop()
 
 	var flushC <-chan time.Time
 	if ticker != nil {
@@ -265,6 +300,8 @@ func (p *Pipeline) Run() {
 			p.process(s)
 		case <-flushC:
 			p.flushIfOld()
+		case <-p.maintTimer.C:
+			p.maintain()
 		}
 	}
 }
@@ -398,7 +435,11 @@ func (p *Pipeline) persist(cal model.CalibratedSample, events []model.Event) {
 	}
 	p.flushRejectedIntoBatch()
 	p.batchCount++
-	if p.batchCount >= p.cfg.BatchSize {
+	roll := p.batchCount >= p.cfg.BatchSize
+	if p.cfg.SegmentMaxBytes > 0 && p.st.BatchSizeBytes(p.openBatch) >= p.cfg.SegmentMaxBytes {
+		roll = true
+	}
+	if roll {
 		p.sealBatch()
 	}
 }
@@ -419,6 +460,23 @@ func (p *Pipeline) ensureBatch(now time.Time) error {
 	return nil
 }
 
+// maintain archives sealed segments older than ArchiveAfter (best effort;
+// segments currently being read stay in place) and enforces the storage
+// quota. It runs on the single worker goroutine, so it never races writing.
+func (p *Pipeline) maintain() {
+	if p.cfg.ArchiveAfter > 0 {
+		cutoff := time.Now().Add(-p.cfg.ArchiveAfter)
+		for _, m := range p.st.Segments() {
+			if m.State == model.BatchComplete && !m.ClosedAt.IsZero() && m.ClosedAt.Before(cutoff) {
+				_ = p.st.ArchiveBatch(m.ID)
+			}
+		}
+	}
+	if p.cfg.StorageLimit > 0 {
+		_, _, _, _ = p.st.EnforceQuota()
+	}
+}
+
 func (p *Pipeline) sealBatch() {
 	if p.openBatch == "" {
 		return
@@ -432,13 +490,16 @@ func (p *Pipeline) sealBatch() {
 	p.statsMu.Unlock()
 	p.openBatch = ""
 	p.batchCount = 0
+	if p.cfg.StorageLimit > 0 {
+		_, _, _, _ = p.st.EnforceQuota()
+	}
 }
 
 func (p *Pipeline) flushIfOld() {
 	if p.openBatch == "" {
 		return
 	}
-	if time.Since(p.batchSince) >= p.cfg.FlushInterval {
+	if p.cfg.SegmentMaxAge > 0 && time.Since(p.batchSince) >= p.cfg.SegmentMaxAge {
 		p.sealBatch()
 	}
 }

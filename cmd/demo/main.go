@@ -19,12 +19,17 @@ import (
 	"github.com/lechandonga/biosignal-capture-pipeline-go/pkg/device"
 	"github.com/lechandonga/biosignal-capture-pipeline-go/pkg/model"
 	"github.com/lechandonga/biosignal-capture-pipeline-go/pkg/pipeline"
+	"github.com/lechandonga/biosignal-capture-pipeline-go/pkg/query"
 	"github.com/lechandonga/biosignal-capture-pipeline-go/pkg/storage"
 )
 
 func main() {
 	dir := flag.String("dir", filepath.Join(os.TempDir(), "biosignal-demo"), "storage root")
 	duration := flag.Duration("duration", 3*time.Second, "simulated wall-clock session length")
+	segSamples := flag.Int("segsize", 40, "max calibrated samples per segment")
+	segBytes := flag.Int64("segbytes", 0, "max on-disk bytes per segment (0 = unlimited)")
+	archiveAfter := flag.Duration("archive-after", 5*time.Second, "auto-archive sealed segments older than this")
+	storageLimit := flag.Int64("quota", 0, "max total storage bytes; oldest sealed segments are reclaimed (0 = unlimited)")
 	flag.Parse()
 
 	// Fresh area for a repeatable run; remove the root to start clean.
@@ -55,8 +60,10 @@ func main() {
 		Window: 1, MinQuality: 0.5, High: 15, Low: 25, Op: detect.OpGT,
 	}}
 	p := pipeline.New(pipeline.Config{
-		SessionID: "demo", QueueDepth: 4096, BatchSize: 128,
-		FlushInterval: time.Second, Policy: pipeline.PolicyDelay, EnqueueWait: 20 * time.Millisecond,
+		SessionID: "demo", QueueDepth: 4096, BatchSize: *segSamples,
+		SegmentMaxBytes: *segBytes, ArchiveAfter: *archiveAfter,
+		StorageLimit: *storageLimit, Maintenance: 200 * time.Millisecond,
+		Policy: pipeline.PolicyDelay, EnqueueWait: 20 * time.Millisecond,
 	}, cals, rules, st)
 
 	must(p.RegisterDevice("wrist-1"))
@@ -146,6 +153,48 @@ func main() {
 			fmt.Printf("  EVENT %s sensor=%s value=%.3f thr=%.3f cal=%s\n    evidence: %s\n",
 				ev.Level, ev.Sensor, ev.Value, ev.Threshold, ev.CalVersion, ev.Evidence)
 		}
+	}
+
+	// Cross-segment time-range query: merge segments into one timeline and
+	// show the completeness partition (COMPLETE / INCOMPLETE / NO_DATA).
+	fmt.Println("\n=== cross-segment time-range query ===")
+	f := query.Filter{
+		From: t0, To: t0.Add(*duration + 2*time.Second),
+		SessionID: "demo",
+	}
+	var qSamples, qEvents, qRejects int
+	qStats, qRep, err := query.Export(st, f, func(r storage.SegmentRecord) error {
+		switch {
+		case r.Sample != nil:
+			qSamples++
+		case r.Event != nil:
+			qEvents++
+		case r.Rejected != nil:
+			qRejects++
+		}
+		return nil
+	})
+	must(err)
+	fmt.Printf("merged samples=%d events=%d rejected=%d (touched %d segments)\n",
+		qStats.Samples, qStats.Events, qStats.Rejected, len(qRep.Segments))
+	_ = qSamples
+	_ = qEvents
+	_ = qRejects
+	for _, rg := range qRep.Ranges {
+		fmt.Printf("  %s  %s -> %s  reasons=%v\n", rg.Verdict,
+			rg.From.Format("15:04:05.000"), rg.To.Format("15:04:05.000"), rg.Reasons)
+	}
+
+	if *storageLimit > 0 {
+		if log, err := st.ReclaimLog(); err == nil {
+			var freed int64
+			for _, e := range log {
+				freed += e.BytesFreed
+			}
+			fmt.Printf("\n=== reclaim audit: %d segments, %d bytes freed ===\n", len(log), freed)
+		}
+		limit, used := st.Quota()
+		fmt.Printf("quota limit=%d used=%d\n", limit, used)
 	}
 	fmt.Println("\nstorage root:", *dir)
 }
